@@ -879,7 +879,7 @@ def get_tree_str(tree, combine_rows=True):
     if combine_rows is True:
         # on first non-recursive call, add top node to first row
         rows.append("node-%s" % tree["node"])
-    if len(tree["oif"])>0:
+    if len(tree["oif"])>0 or len(tree["invalid_oif"])>0:
         oif_count = 0
         # valid oifs
         for oif in sorted(tree["oif"], key=lambda k: int(k["remote_node"])):
