@@ -261,9 +261,6 @@ class NodeFtag(object):
         # add root port to this ftag.  
         # Return boolean success flag
 
-        # always try to add root_port to oif list first
-        self.add_oif_list([root_port])
-
         if root_port == "" or root_port == "unspecified":
             root_port = "unspecified"
         else:
@@ -933,7 +930,7 @@ def main(args):
     if roots is None:
         logger.error("failed to build ftags/roots")
         return
-  
+
     # first check that provided pod exists
     if args.pod is not None and "%s"%args.pod not in roots:
         print "Pod %s not found" % args.pod
