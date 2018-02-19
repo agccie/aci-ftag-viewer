@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 OFFLINE_OBJECTS = [ "fabricNode", "fmcastTreeEp", "isisFmcastTree",
     "isisOifListLeaf", "isisOifListSpine", "isisAdjEp", "isisDom", 
-    "lldpAdjEp", "topSystem"]
+    "l3extRsPathL3OutAtt", "lldpAdjEp", "topSystem"]
 OFFLINE_FILES = {}
 OFFLINE_MODE = False
 
@@ -356,6 +356,20 @@ class NodeAdj(object):
                     self.sideA["local"]["node"], self.sideA["local"]["port"],
                     self.sideB["local"]["node"], self.sideB["local"]["port"])
 
+class LldpAdjEp(object):
+    """ track lldp peer info """
+    def __init__(self, lldp):
+        # only grab what we care about for now
+        self.mgmt_ip = lldp.get("mgmtIp", "")
+        self.mgmt_port_mac = lldp.get("mgmtPortMac", "")
+        self.chassis_id_type = lldp.get("chassisIdT", "")
+        self.chassis_id = lldp.get("chassisIdV", "")
+        self.port_type = lldp.get("portIdT", "")
+        self.port = lldp.get("portIdV", "")
+        self.port_vlan = lldp.get("portVlan", "")
+        self.sys_name = lldp.get("sysName", "")
+        self.sys_desc = lldp.get("sysDesc", "")
+
 class Node(object):
     """ aci node """
     def __init__(self, **kwargs):
@@ -368,12 +382,32 @@ class Node(object):
         self.lldp_adj = {}      # indexed by interface number
         self.isis_adj = {}      # indexed by interface number
         self.ftags = {}         # indexed by ftag number
+        self.l3_ext_intfs = []  # spines external interfaces on overlay-1
+        self.lldp_adj_ep = {}   # lldp info per local port (not necessarily a
+                                # valid two-adjacency)
 
         # sanity, ensure all attributes are set
         assert self.node_id is not None
         assert self.pod_id is not None
         assert self.address is not None
         assert self.role is not None
+
+    def add_external_interface(self, local_port):
+        # add external interface filtering on spines role only
+        if self.role != "spine": return
+        if local_port not in self.l3_ext_intfs:     
+            logger.debug("adding external interface %s: %s" % (self.node_id,
+                local_port))
+            self.l3_ext_intfs.append(local_port)
+
+    def is_external_interface(self, local_port):
+        # return true if interface is in l3_ext_intfs list
+        return local_port in self.l3_ext_intfs
+
+    def add_lldp_neighbor_info(self, local_port, lldp_adj_ep):
+        # add lldp adjacency info to node
+        if local_port not in self.lldp_adj_ep:
+            self.lldp_adj_ep[local_port] = lldp_adj_ep
 
     def add_lldp_neighbor(self, local_port, adj):
         # add lldp adjacency to node
@@ -423,11 +457,18 @@ class Node(object):
             remote_node_id = "?"
             remote_port = "?"
             valid_oif = True
+            is_external = False
             # verify adj exists for local port
             if port not in self.isis_adj or not self.isis_adj[port].complete:
-                logger.warn("invalid isis adj on port %s in tree %s of %s"%(
-                    port, tree_id, self))
                 valid_oif = False
+                # check if this is an external spine interface
+                if self.is_external_interface(port):
+                    logger.debug("oif for external port %s in tree %s of %s"%(
+                        port, tree_id, self))
+                    is_external = True
+                else:
+                    logger.warn("invalid isis adj on port %s in tree %s of %s"%(
+                        port, tree_id, self))
             # should never happen since isis_adj built after successful lldp
             elif port not in self.lldp_adj or not self.lldp_adj[port].complete:
                 logger.warn("invalid lldp adj on port %s in tree %s of %s"%s(
@@ -480,16 +521,23 @@ class Node(object):
                         "local_node": self.node_id,
                         "local_port": port,
                         "remote_port": remote_port,
-                        "remote_node": remote_node_id
+                        "remote_node": remote_node_id,
                     })
             # add invalid link but do not continue walking subtree
             else:
+                # for external interfaces, encode lldp info for remote
+                # port and node if present
+                if port in self.lldp_adj_ep:
+                    lldp_info = self.lldp_adj_ep[port]
+                    remote_port = lldp_info.port
+                    remote_node_id = lldp_info.sys_name
                 tree["invalid_oif"].append({
                     "subtree":subtree,
                     "local_node": self.node_id,
                     "local_port": port,
                     "remote_port": remote_port,
-                    "remote_node": remote_node_id
+                    "remote_node": remote_node_id,
+                    "is_external": is_external
                 })
             
     def __repr__(self):
@@ -566,6 +614,32 @@ def build_nodes():
             logger.warn("system ID not found for node %s" % nodes[node_id])
             return None
 
+    # add l3ext interfaces for spines
+    l3extRsPathL3OutAtt = get_class("l3extRsPathL3OutAtt")
+    if l3extRsPathL3OutAtt is None:
+        logger.error("failed to get l3extRsPathL3OutAtt")
+        l3extRsPathL3Out = []
+    _r = "topology/pod-(?P<pod>[0-9]+)/paths-(?P<node>[0-9]+)"
+    reg_port = re.compile("%s/pathep-\[eth(?P<port>[0-9]+/[0-9]+)\]" % _r)
+    for obj in l3extRsPathL3OutAtt:
+       if "attributes" in obj[obj.keys()[0]]:
+            attr = obj[obj.keys()[0]]["attributes"]
+            for a in ["dn", "encap", "addr", "tDn"]:
+                if a not in attr:
+                    logger.warn("object missing %s: %s" % (a, 
+                        pretty_print(obj)))
+                    continue
+                r1 = reg_port.search(attr["tDn"])
+            if r1 is None:  
+                logger.debug("failed to parse dn for object: %s" % attr["dn"])
+                continue
+            node_id = r1.group("node")
+            local_port = r1.group("port")
+            if node_id not in nodes:
+                logger.warn("skipping unknown node: %s" % node_id)
+                continue
+            nodes[node_id].add_external_interface(local_port)
+
     # get LLDP adjacency to build fabric graph
     lldpAdjEp = get_class("lldpAdjEp")
     if lldpAdjEp is None:
@@ -592,6 +666,8 @@ def build_nodes():
             if local_node_id not in nodes:
                 logger.warn("skipping unknown node: %s" % local_node_id)
                 continue
+            nodes[local_node_id].add_lldp_neighbor_info(local_port, 
+                                                            LldpAdjEp(attr))
             r2 = reg_node.search(attr["sysDesc"])
             if r2 is None:  
                 # ok to fail to parse sysDesc, would imply neighbor is not ACI
@@ -811,8 +887,10 @@ def build_ftags(nodes):
                 continue
             node = nodes[node_id]
             # for the root itself, root port should be unspecified and 
-            # root should point to local address
-            if attr["root"] == node.address:
+            # root should point to local address OR can be 0.0.0.0 with operSt
+            # set to active
+            if attr["root"] == node.address or (attr["root"] == "0.0.0.0" and \
+                attr["operSt"]=="active" and node.role=="spine"):
                 logger.debug("%s claiming root for tree %s" % (node, tree_id))
                 if attr["rootPort"]!="" and attr["rootPort"]!="unspecified":
                     # print warning but continue with operation
@@ -849,7 +927,7 @@ def build_ftags(nodes):
             r1 = reg_oif_list.search(attr["dn"])
             if r1 is None:
                 # dn's will fail to parse if they are GiPo instead of ftags
-                logger.debug("failed to parse dn for object: %s" % attr["dn"])
+                #logger.debug("failed to parse dn for object: %s" % attr["dn"])
                 continue
             node_id = r1.group("node")
             tree_id = r1.group("tree")
@@ -872,7 +950,8 @@ def get_tree_str(tree, combine_rows=True):
     #   }],
     #   "invalid_oif": [{
     #       "remote_node":"", "remote_port":"", "local_node":"",
-    #       "local_port":"", "subtree":{}  <-- subtree should always be empty
+    #       "local_port":"", "subtree":{},  <-- subtree should always be empty
+    #       "is_external":bool (True for external spine interfaces)
     #   }],
 
     rows = []
@@ -903,13 +982,21 @@ def get_tree_str(tree, combine_rows=True):
         oif_count = 0
         for oif in sorted(tree["invalid_oif"], key=lambda k: k["remote_node"]):
             oif_count+=1
-            pad_len = 15 - len(oif["local_port"]) - len(oif["remote_port"])
-            if pad_len < 0: pad_len = 0
-            rows.append("  +- %s %s %s node-%s" % (
+            if oif["is_external"]:
+                pad_len = 10 - len(oif["local_port"]) 
+                if pad_len < 0: pad_len = 0
+                node_str = "%s %s" % (oif["remote_port"], oif["remote_node"])
+                node_str = "(EXT) %s" % node_str
+                pad_char = "."
+            else:
+                pad_len = 15 - len(oif["local_port"]) - len(oif["remote_port"])
+                if pad_len < 0: pad_len = 0
+                pad_char = "x"
+                node_str = "%s node-%s"%(oif["remote_port"],oif["remote_node"])
+            rows.append("  +- %s %s %s" % (
                 oif["local_port"],
-                "x"*pad_len,
-                oif["remote_port"],
-                oif["remote_node"]
+                pad_char*pad_len,
+                node_str,
                 ))
             
        
