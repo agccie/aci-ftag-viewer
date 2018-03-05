@@ -489,9 +489,11 @@ class Node(object):
                             port, tree_id, self))
                         valid_oif = False
             
-            # next checks only if oif is still valide
+            # next checks only if oif is still valid
+            remote_role = ""
             if valid_oif:
                 remote_node = nodes[remote_node_id]
+                remote_role = remote_node.role
                 # validate neighbor on this link by verifying it has 
                 # corresponding port in it's oif for this tree
                 if tree_id not in remote_node.ftags or \
@@ -522,12 +524,13 @@ class Node(object):
                         "local_port": port,
                         "remote_port": remote_port,
                         "remote_node": remote_node_id,
+                        "remote_role": remote_role,
                     })
             # add invalid link but do not continue walking subtree
             else:
                 # for external interfaces, encode lldp info for remote
                 # port and node if present
-                if port in self.lldp_adj_ep:
+                if port in self.lldp_adj_ep and is_external:
                     lldp_info = self.lldp_adj_ep[port]
                     remote_port = lldp_info.port
                     remote_node_id = lldp_info.sys_name
@@ -537,7 +540,8 @@ class Node(object):
                     "local_port": port,
                     "remote_port": remote_port,
                     "remote_node": remote_node_id,
-                    "is_external": is_external
+                    "is_external": is_external,
+                    "remote_role": remote_role,
                 })
             
     def __repr__(self):
@@ -940,15 +944,17 @@ def build_ftags(nodes):
 
     return roots
 
-def get_tree_str(tree, combine_rows=True):
+def get_tree_str(tree, root=None, combine_rows=True):
     # receive tree built from walk_tree and print in user-friendly format
     # tree in format:
     #   "node": "",
     #   "oif": [{
+    #       "remote_role": "spine|leaf" or empty
     #       "remote_node":"", "remote_port":"", "local_node":"",
     #       "local_port":"", "subtree":{}
     #   }],
     #   "invalid_oif": [{
+    #       "remote_role":"spine|leaf" or empty
     #       "remote_node":"", "remote_port":"", "local_node":"",
     #       "local_port":"", "subtree":{},  <-- subtree should always be empty
     #       "is_external":bool (True for external spine interfaces)
@@ -957,7 +963,9 @@ def get_tree_str(tree, combine_rows=True):
     rows = []
     if combine_rows is True:
         # on first non-recursive call, add top node to first row
-        rows.append("node-%s" % tree["node"])
+        role = "node"
+        if root is not None: role = root.role
+        rows.append("%s-%s" % (role, tree["node"]))
     if len(tree["oif"])>0 or len(tree["invalid_oif"])>0:
         oif_count = 0
         # valid oifs
@@ -965,10 +973,12 @@ def get_tree_str(tree, combine_rows=True):
             oif_count+=1
             pad_len = 15 - len(oif["local_port"]) - len(oif["remote_port"])
             if pad_len < 0: pad_len = 0
-            rows.append("  +- %s %s %s node-%s" % (
+            role = oif.get("remote_role", "node")
+            rows.append("  +- %s %s %s %s-%s" % (
                 oif["local_port"],
                 "-"*pad_len,
                 oif["remote_port"],
+                role,
                 oif["remote_node"]
                 ))
             subtree_rows = get_tree_str(oif["subtree"], combine_rows=False)
@@ -992,7 +1002,11 @@ def get_tree_str(tree, combine_rows=True):
                 pad_len = 15 - len(oif["local_port"]) - len(oif["remote_port"])
                 if pad_len < 0: pad_len = 0
                 pad_char = "x"
-                node_str = "%s node-%s"%(oif["remote_port"],oif["remote_node"])
+                node_str = "%s %s-%s"%(
+                    oif["remote_port"],
+                    oif.get("remote_role", "node"),
+                    oif["remote_node"]
+                )
             rows.append("  +- %s %s %s" % (
                 oif["local_port"],
                 pad_char*pad_len,
@@ -1071,19 +1085,22 @@ def main(args):
             # check member_nodes and ensure that all nodes in the pod where
             # discovered on the tree
             missing_nodes = []
+            active_nodes = 0
             for node_id in nodes:
                 node = nodes[node_id]
                 if node.pod_id != pod_id: continue
+                active_nodes+= 1
                 if node_id not in member_nodes:
                     missing_nodes.append(node_id)
 
             print "\n"
             print "#"*80
             print "#  Pod %s FTAG %s" % (pod_id, tree_id)
+            print "#  Root %s-%s" % (root_node.role, root_node.node_id)
             print "#  active nodes: %s, inactive nodes: %s" % (
-                len(nodes)-len(missing_nodes), len(missing_nodes))
+                active_nodes-len(missing_nodes), len(missing_nodes))
             print "#"*80
-            print get_tree_str(tree) 
+            print get_tree_str(tree, root=root_node) 
             print "\n"
 
             if len(missing_nodes)>0:
